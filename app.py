@@ -14,10 +14,10 @@ def call_fas(endpoint, params=None):
         return {"ok": False, "error": "FAS_API_KEY não configurada no Render."}, 500
 
     url = f"{BASE}/{endpoint.lstrip('/')}"
-    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/1.1"}
+    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/1.2"}
 
     try:
-        r = requests.get(url, headers=headers, params=params or {}, timeout=45)
+        r = requests.get(url, headers=headers, params=params or {}, timeout=60)
     except Exception as e:
         return {"ok": False, "error": "Falha de conexão com a API do FAS.", "details": str(e), "url": url}, 502
 
@@ -35,29 +35,36 @@ def normalize(s: str) -> str:
     return s
 
 
-# “Tradução” rápida PT -> nomes que existem na lista do USDA
-PT_TO_EN = {
-    "soja": "soybeans",
-    "milho": "corn",
-    "arroz": "rice",
-    "cafe": "coffee",
-    "café": "coffee",
-    "acucar": "sugar",
-    "açúcar": "sugar",
+def strip_nonletters(s: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", "", normalize(s))
+
+
+# Traduções PT -> possíveis formas em EN
+PT_TO_EN_ALIASES = {
+    "soja": ["soybeans", "soybean"],
+    "milho": ["corn", "maize"],
+    "arroz": ["rice"],
+    "cafe": ["coffee"],
+    "café": ["coffee"],
+    "acucar": ["sugar"],
+    "açúcar": ["sugar"],
 }
 
 
-def translate_commodity_name(name: str) -> str:
-    n = normalize(name)
-    return PT_TO_EN.get(n, name)
-
-
 def find_best_match(items, wanted, keys):
+    """
+    Procura por:
+    1) contém (normalizado)
+    2) igual (normalizado)
+    3) contém (sem caracteres especiais)
+    """
     w = normalize(wanted)
+    w2 = strip_nonletters(wanted)
+
     if not w or not isinstance(items, list):
         return None
 
-    # contém
+    # contém (normal)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -66,7 +73,7 @@ def find_best_match(items, wanted, keys):
             if isinstance(v, str) and w in normalize(v):
                 return it
 
-    # igual
+    # igual (normal)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -75,7 +82,156 @@ def find_best_match(items, wanted, keys):
             if isinstance(v, str) and w == normalize(v):
                 return it
 
+    # contém (limpo)
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        for k in keys:
+            v = it.get(k)
+            if isinstance(v, str) and w2 and w2 in strip_nonletters(v):
+                return it
+
     return None
+
+
+def resolve_commodity_code(commodities_list, commodity_name):
+    """
+    Resolve commodity code aceitando:
+    - nome em PT (soja)
+    - nome em EN (soybeans)
+    - variações (soybean)
+    - ou código direto (ex.: 0440000)
+    """
+    raw = (commodity_name or "").strip()
+
+    # Se o usuário já passou um código numérico, usa direto
+    if re.fullmatch(r"\d{5,8}", raw):
+        return raw, {"CommodityName_found": None}
+
+    # tenta PT aliases
+    aliases = PT_TO_EN_ALIASES.get(normalize(raw), [raw])
+
+    for name_try in aliases + [raw]:
+        hit = find_best_match(
+            commodities_list,
+            name_try,
+            keys=["CommodityName", "commodityName", "Name", "name", "CommodityDescription", "Description"]
+        )
+        if hit:
+            code = hit.get("CommodityCode") or hit.get("commodityCode") or hit.get("Code") or hit.get("Id")
+            found_name = (hit.get("CommodityName") or hit.get("commodityName") or hit.get("Name") or "").strip()
+            if code:
+                return code, {"CommodityName_found": found_name}
+
+    return None, None
+
+
+def resolve_country_code(countries_list, country_name):
+    """
+    Resolve country code para país comum, e também encontra o 'World'.
+    """
+    hit = find_best_match(
+        countries_list,
+        country_name,
+        keys=["CountryName", "countryName", "Name", "name", "CountryDescription", "Description"]
+    )
+    if not hit:
+        return None, None
+
+    code = hit.get("CountryCode") or hit.get("countryCode") or hit.get("Code") or hit.get("Id")
+    found_name = (hit.get("CountryName") or hit.get("countryName") or hit.get("Name") or "").strip()
+    return code, found_name
+
+
+def pick_world_code(countries_list):
+    """
+    Tenta encontrar o registro 'World' na lista.
+    """
+    for name_try in ["world", "World", "WORLD", "global", "Global"]:
+        code, found = resolve_country_code(countries_list, name_try)
+        if code:
+            return code, found
+    # fallback: procura por qualquer countryName contendo 'world'
+    hit = find_best_match(countries_list, "world", ["CountryName", "countryName", "Name", "name"])
+    if hit:
+        code = hit.get("CountryCode") or hit.get("countryCode") or hit.get("Code") or hit.get("Id")
+        found = (hit.get("CountryName") or hit.get("countryName") or hit.get("Name") or "").strip()
+        if code:
+            return code, found
+    return None, None
+
+
+def filter_to_balance_sheet(rows):
+    wanted = {
+        "Production",
+        "Domestic Consumption",
+        "MY Imports",
+        "TY Imports",
+        "MY Exports",
+        "TY Exports",
+        "Beginning Stocks",
+        "Ending Stocks",
+        "Total Supply",
+    }
+    out = []
+    for r in rows:
+        ad = (r.get("AttributeDescription") or "").strip()
+        if ad in wanted:
+            out.append(r)
+    return out
+
+
+def summarize(rows):
+    summary = {}
+    units = {}
+    meta = {}
+
+    for r in rows:
+        k = (r.get("AttributeDescription") or "").strip()
+        if not k:
+            continue
+        summary[k] = r.get("Value")
+        units[k] = (r.get("UnitDescription") or "").strip()
+        meta = {
+            "CommodityDescription": (r.get("CommodityDescription") or "").strip(),
+            "CountryName": (r.get("CountryName") or "").strip(),
+            "MarketYear": r.get("MarketYear"),
+            "Month": r.get("Month"),
+            "CalendarYear": r.get("CalendarYear"),
+        }
+
+    return summary, units, meta
+
+
+def sum_across_countries(rows):
+    """
+    Se não existir um 'World' explícito, soma por atributo (cuidado: isso é fallback).
+    """
+    acc = {}
+    units = {}
+    meta = {"CountryName": "World (computed sum)"}
+
+    for r in rows:
+        k = (r.get("AttributeDescription") or "").strip()
+        if not k:
+            continue
+        v = r.get("Value")
+        if isinstance(v, (int, float)):
+            acc[k] = acc.get(k, 0) + v
+        # pega uma unidade "qualquer" por atributo
+        if k not in units:
+            units[k] = (r.get("UnitDescription") or "").strip()
+        # meta básica
+        if "CommodityDescription" not in meta and r.get("CommodityDescription"):
+            meta["CommodityDescription"] = (r.get("CommodityDescription") or "").strip()
+        if "MarketYear" not in meta and r.get("MarketYear"):
+            meta["MarketYear"] = r.get("MarketYear")
+        if "Month" not in meta and r.get("Month"):
+            meta["Month"] = r.get("Month")
+        if "CalendarYear" not in meta and r.get("CalendarYear"):
+            meta["CalendarYear"] = r.get("CalendarYear")
+
+    return acc, units, meta
 
 
 @app.route("/", methods=["GET"])
@@ -84,12 +240,11 @@ def home():
         "ok": True,
         "use": [
             "/health",
-            "/_routes",
             "/commodities",
             "/countries",
             "/psd?commodity=soja&country=brasil&year=2024",
             "/psd?commodity=milho&country=mundo&year=2024",
-            "/psd?commodity=rice&country=india&year=2024"
+            "/psd?commodity=soybeans&country=world&year=2024"
         ]
     })
 
@@ -97,11 +252,6 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "fas_key_configured": bool(FAS_KEY), "base": BASE})
-
-
-@app.route("/_routes", methods=["GET"])
-def routes():
-    return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
 
 
 @app.route("/commodities", methods=["GET"])
@@ -116,87 +266,35 @@ def countries():
     return jsonify(env), st
 
 
-def filter_to_balance_sheet(rows):
-    """
-    Mantém só os itens mais importantes para “balanço”:
-    produção, consumo, importação, exportação, estoque final.
-    (Os nomes vêm da própria API.)
-    """
-    wanted = {
-        "Production",
-        "TY Exports",
-        "MY Exports",
-        "TY Imports",
-        "MY Imports",
-        "Domestic Consumption",
-        "Feed Dom. Consumption",
-        "Food Use Dom. Consumption",
-        "Industrial Dom. Consumption",
-        "Ending Stocks",
-        "Beginning Stocks",
-    }
-    out = []
-    for r in rows:
-        ad = (r.get("AttributeDescription") or "").strip()
-        if ad in wanted:
-            out.append(r)
-    return out
-
-
-def summarize(rows):
-    """
-    Converte a lista de linhas em uma tabelinha simples:
-    { "Production": 123, "TY Exports": 45, ... }
-    """
-    summary = {}
-    unit = {}
-    meta = {}
-    for r in rows:
-        k = (r.get("AttributeDescription") or "").strip()
-        if not k:
-            continue
-        summary[k] = r.get("Value")
-        unit[k] = (r.get("UnitDescription") or "").strip()
-        meta = {
-            "CommodityDescription": (r.get("CommodityDescription") or "").strip(),
-            "CountryName": (r.get("CountryName") or "").strip(),
-            "MarketYear": r.get("MarketYear"),
-            "Month": r.get("Month"),
-            "CalendarYear": r.get("CalendarYear"),
-        }
-    return summary, unit, meta
-
-
 @app.route("/psd", methods=["GET"])
 def psd():
     commodity_name = request.args.get("commodity", "")
     country_name = request.args.get("country", "mundo")
     year = request.args.get("year", "")
+    commodity_code_direct = request.args.get("commodityCode", "")
 
-    if not commodity_name or not year:
+    if not year or (not commodity_name and not commodity_code_direct):
         return jsonify({"error": "Use /psd?commodity=soja&country=brasil&year=2024"}), 400
 
-    # 1) traduz commodity PT -> EN (se necessário)
-    commodity_name2 = translate_commodity_name(commodity_name)
-
-    # 2) resolve commodity code
+    # 1) commodities list
     c_env, st = call_fas("LookupData/GetCommodities")
     if st != 200 or not c_env.get("ok"):
         return jsonify({"error": "Falha ao buscar commodities", "details": c_env}), 502
 
     commodities_list = c_env.get("data", [])
-    commodity = find_best_match(commodities_list, commodity_name2, ["CommodityName", "commodityName", "Name", "name"])
-    if not commodity:
-        return jsonify({
-            "error": f"Commodity não encontrada: {commodity_name}",
-            "hint": "Tente também em inglês (soybeans, corn, rice) ou consulte /commodities."
-        }), 404
 
-    commodity_code = commodity.get("CommodityCode") or commodity.get("commodityCode") or commodity.get("Code")
-    if not commodity_code:
-        return jsonify({"error": "Não achei CommodityCode.", "sample": commodity}), 500
+    if commodity_code_direct:
+        commodity_code = commodity_code_direct.strip()
+        resolved_commodity = {"CommodityName_found": None}
+    else:
+        commodity_code, resolved_commodity = resolve_commodity_code(commodities_list, commodity_name)
+        if not commodity_code:
+            return jsonify({
+                "error": f"Commodity não encontrada: {commodity_name}",
+                "hint": "Teste 'soybeans' ou abra /commodities e procure o nome exato."
+            }), 404
 
-    # 3) baixar dados do ano (vem muitos países) e filtrar depois
+    # 2) fetch year data (all countries)
     d_env, st = call_fas("CommodityData/GetCommodityDataByYear", params={"CommodityCode": commodity_code, "marketYear": int(year)})
     if st != 200 or not d_env.get("ok"):
         return jsonify({"error": "Falha ao buscar dados", "details": d_env}), 502
@@ -205,36 +303,71 @@ def psd():
     if not isinstance(rows, list) or not rows:
         return jsonify({"error": "Sem dados retornados para esse ano/commodity."}), 404
 
-    # 4) filtrar país
+    # 3) balance sheet only
+    rows = filter_to_balance_sheet(rows)
+
+    # 4) country filter
     is_world = normalize(country_name) in ["world", "mundo", "global", "all"]
-    if not is_world:
+
+    if is_world:
+        # tenta achar o countryCode de World e filtrar
         p_env, st2 = call_fas("LookupData/GetCountries")
-        if st2 != 200 or not p_env.get("ok"):
-            return jsonify({"error": "Falha ao buscar países", "details": p_env}), 502
+        if st2 == 200 and p_env.get("ok"):
+            countries_list = p_env.get("data", [])
+            world_code, world_name = pick_world_code(countries_list)
+            if world_code:
+                world_rows = [r for r in rows if (r.get("CountryCode") or "").strip() == world_code]
+                if world_rows:
+                    summary, units, meta = summarize(world_rows)
+                    meta["CountryName"] = world_name or meta.get("CountryName") or "World"
+                    return jsonify({
+                        "request": {"commodity": commodity_name, "country": country_name, "year": year},
+                        "resolved": {
+                            "CommodityCode": commodity_code,
+                            **resolved_commodity,
+                            "CountryScope": "World (official row)"
+                        },
+                        "meta": meta,
+                        "balance_sheet": summary,
+                        "units": units
+                    }), 200
 
-        countries_list = p_env.get("data", [])
-        country = find_best_match(countries_list, country_name, ["CountryName", "countryName", "Name", "name"])
-        if not country:
-            return jsonify({"error": f"País não encontrado: {country_name}", "hint": "Consulte /countries."}), 404
+        # fallback: soma
+        summary, units, meta = sum_across_countries(rows)
+        return jsonify({
+            "request": {"commodity": commodity_name, "country": country_name, "year": year},
+            "resolved": {
+                "CommodityCode": commodity_code,
+                **(resolved_commodity or {}),
+                "CountryScope": "World (computed sum)"
+            },
+            "meta": meta,
+            "balance_sheet": summary,
+            "units": units
+        }), 200
 
-        country_code = country.get("CountryCode") or country.get("countryCode") or country.get("Code")
-        if not country_code:
-            return jsonify({"error": "Não achei CountryCode.", "sample": country}), 500
+    # país normal
+    p_env, st2 = call_fas("LookupData/GetCountries")
+    if st2 != 200 or not p_env.get("ok"):
+        return jsonify({"error": "Falha ao buscar países", "details": p_env}), 502
 
-        rows = [r for r in rows if (r.get("CountryCode") or "").strip() == country_code]
-        if not rows:
-            return jsonify({"error": f"Sem dados para o país: {country_name} nesse ano."}), 404
+    countries_list = p_env.get("data", [])
+    country_code, found_country_name = resolve_country_code(countries_list, country_name)
+    if not country_code:
+        return jsonify({"error": f"País não encontrado: {country_name}", "hint": "Abra /countries para ver o nome exato."}), 404
 
-    # 5) filtrar para balanço + resumir
-    rows2 = filter_to_balance_sheet(rows)
-    summary, units, meta = summarize(rows2)
+    rows = [r for r in rows if (r.get("CountryCode") or "").strip() == country_code]
+    if not rows:
+        return jsonify({"error": f"Sem dados para o país: {found_country_name} nesse ano."}), 404
 
+    summary, units, meta = summarize(rows)
     return jsonify({
         "request": {"commodity": commodity_name, "country": country_name, "year": year},
         "resolved": {
             "CommodityCode": commodity_code,
-            "CommodityName_found": (commodity.get("CommodityName") or "").strip(),
-            "scope": "world" if is_world else "country"
+            **(resolved_commodity or {}),
+            "CountryCode": country_code,
+            "CountryName_found": found_country_name
         },
         "meta": meta,
         "balance_sheet": summary,
