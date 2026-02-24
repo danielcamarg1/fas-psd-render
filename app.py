@@ -14,7 +14,7 @@ def call_fas(endpoint, params=None):
         return {"ok": False, "error": "FAS_API_KEY não configurada no Render."}, 500
 
     url = f"{BASE}/{endpoint.lstrip('/')}"
-    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/1.3"}
+    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/1.4"}
 
     try:
         r = requests.get(url, headers=headers, params=params or {}, timeout=60)
@@ -39,27 +39,26 @@ def strip_nonletters(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", normalize(s))
 
 
-# Commodity: PT -> tentativas EN (mas vamos escolher de forma inteligente)
-PT_COMMODITY_ALIASES = {
-    "soja": ["soybeans", "soybean"],
-    "milho": ["corn", "maize"],
-    "arroz": ["rice"],
-    "cafe": ["coffee"],
-    "café": ["coffee"],
-    "acucar": ["sugar"],
-    "açúcar": ["sugar"],
+# ✅ Atalhos FIXOS (para não cair no produto errado)
+# Ajuste aqui conforme você for adicionando commodities.
+FORCED_COMMODITY_CODES = {
+    # soja = grão
+    "soja": "0811000",        # Soybeans (beans)
+    "soybeans": "0811000",
+    "soybean": "0811000",
+    # milho
+    "milho": "0440000",       # Corn
+    "corn": "0440000",
+    # arroz
+    "arroz": None,
 }
 
-# País: PT -> EN mais comum (pode expandir depois)
 PT_COUNTRY_ALIASES = {
     "brasil": "brazil",
     "eua": "united states",
     "estados unidos": "united states",
     "reino unido": "united kingdom",
     "inglaterra": "united kingdom",
-    "russia": "russia",
-    "rússia": "russia",
-    "china": "china",
     "alemanha": "germany",
     "franca": "france",
     "frança": "france",
@@ -75,19 +74,12 @@ PT_COUNTRY_ALIASES = {
 
 
 def find_best_match(items, wanted, keys):
-    """
-    Procura por:
-    1) contém (normalizado)
-    2) igual (normalizado)
-    3) contém (sem caracteres especiais)
-    """
     w = normalize(wanted)
     w2 = strip_nonletters(wanted)
 
     if not w or not isinstance(items, list):
         return None
 
-    # contém (normal)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -96,7 +88,6 @@ def find_best_match(items, wanted, keys):
             if isinstance(v, str) and w in normalize(v):
                 return it
 
-    # igual (normal)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -105,7 +96,6 @@ def find_best_match(items, wanted, keys):
             if isinstance(v, str) and w == normalize(v):
                 return it
 
-    # contém (limpo)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -117,95 +107,8 @@ def find_best_match(items, wanted, keys):
     return None
 
 
-def score_commodity(name: str, target: str) -> int:
-    """
-    Ajuda a escolher a commodity certa quando existem várias parecidas.
-    Quanto maior o score, melhor.
-
-    Regras principais:
-    - Se o target for 'soybeans/soja': preferir 'Soybeans' e evitar 'Meal, Soybean' e 'Oil, Soybean'
-    """
-    n = normalize(name)
-
-    # Caso especial: SOJA -> grão
-    if target in ["soja", "soybeans", "soybean"]:
-        score = 0
-        if "soybeans" in n or n.strip() == "soybeans":
-            score += 100
-        if "meal" in n:
-            score -= 80
-        if "oil" in n:
-            score -= 80
-        if "seed" in n and "soy" in n:
-            score -= 30
-        return score
-
-    return 0
-
-
-def resolve_commodity_code(commodities_list, commodity_name):
-    """
-    Resolve commodity code por nome, com preferência inteligente.
-    Aceita código direto também.
-    """
-    raw = (commodity_name or "").strip()
-
-    # Se já veio um código numérico
-    if re.fullmatch(r"\d{5,8}", raw):
-        return raw, {"CommodityName_found": None}
-
-    base_key = normalize(raw)
-    aliases = PT_COMMODITY_ALIASES.get(base_key, [raw])
-
-    # Coletar candidatos
-    candidates = []
-    for name_try in aliases + [raw]:
-        # em vez de "primeiro que acha", vamos coletar todos os matches "contém"
-        w = normalize(name_try)
-        w2 = strip_nonletters(name_try)
-
-        for it in commodities_list:
-            if not isinstance(it, dict):
-                continue
-            nm = (it.get("CommodityName") or it.get("Name") or it.get("CommodityDescription") or "").strip()
-            if not nm:
-                continue
-            nm_n = normalize(nm)
-            nm_c = strip_nonletters(nm)
-
-            if (w and w in nm_n) or (w2 and w2 in nm_c) or (w and w == nm_n):
-                code = it.get("CommodityCode") or it.get("Code") or it.get("Id")
-                if code:
-                    candidates.append((it, nm, code))
-
-    if not candidates:
-        return None, None
-
-    # Escolher melhor candidato por score
-    best = None
-    best_score = -10**9
-    for it, nm, code in candidates:
-        sc = score_commodity(nm, base_key)
-        # bônus para match exato do nome (quando acontecer)
-        if normalize(nm) == normalize(aliases[0]):
-            sc += 10
-        if sc > best_score:
-            best_score = sc
-            best = (it, nm, code)
-
-    it, nm, code = best
-    return code, {"CommodityName_found": nm}
-
-
 def resolve_country_code(countries_list, country_name):
-    """
-    Resolve país aceitando PT -> EN.
-    """
     raw = (country_name or "").strip()
-    if not raw:
-        return None, None
-
-    # traduz PT->EN quando existir
     translated = PT_COUNTRY_ALIASES.get(normalize(raw), raw)
 
     hit = find_best_match(
@@ -226,7 +129,6 @@ def pick_world_code(countries_list):
         code, found = resolve_country_code(countries_list, name_try)
         if code:
             return code, found
-    # fallback contém
     hit = find_best_match(countries_list, "world", ["CountryName", "Name"])
     if hit:
         code = hit.get("CountryCode") or hit.get("Code") or hit.get("Id")
@@ -332,17 +234,30 @@ def psd():
     if not year or not commodity_name:
         return jsonify({"error": "Use /psd?commodity=soja&country=brasil&year=2024"}), 400
 
-    # 1) buscar commodities e resolver código (com preferência por 'Soybeans' no caso de soja)
-    c_env, st = call_fas("LookupData/GetCommodities")
-    if st != 200 or not c_env.get("ok"):
-        return jsonify({"error": "Falha ao buscar commodities", "details": c_env}), 502
+    # ✅ FORÇA commodity code quando existir no nosso mapa
+    forced_code = FORCED_COMMODITY_CODES.get(normalize(commodity_name))
+    if forced_code:
+        commodity_code = forced_code
+        commodity_found_name = None
+    else:
+        # fallback: tenta achar pelo catálogo
+        c_env, st = call_fas("LookupData/GetCommodities")
+        if st != 200 or not c_env.get("ok"):
+            return jsonify({"error": "Falha ao buscar commodities", "details": c_env}), 502
 
-    commodities_list = c_env.get("data", [])
-    commodity_code, resolved_commodity = resolve_commodity_code(commodities_list, commodity_name)
-    if not commodity_code:
-        return jsonify({"error": f"Commodity não encontrada: {commodity_name}"}), 404
+        commodities_list = c_env.get("data", [])
+        hit = find_best_match(
+            commodities_list,
+            commodity_name,
+            keys=["CommodityName", "Name", "CommodityDescription", "Description"]
+        )
+        if not hit:
+            return jsonify({"error": f"Commodity não encontrada: {commodity_name}"}), 404
 
-    # 2) baixar dados do ano (vem muitos países) e filtrar depois
+        commodity_code = hit.get("CommodityCode") or hit.get("Code") or hit.get("Id")
+        commodity_found_name = (hit.get("CommodityName") or hit.get("Name") or "").strip()
+
+    # dados do ano
     d_env, st = call_fas("CommodityData/GetCommodityDataByYear", params={"CommodityCode": commodity_code, "marketYear": int(year)})
     if st != 200 or not d_env.get("ok"):
         return jsonify({"error": "Falha ao buscar dados", "details": d_env}), 502
@@ -351,14 +266,12 @@ def psd():
     if not isinstance(rows, list) or not rows:
         return jsonify({"error": "Sem dados retornados para esse ano/commodity."}), 404
 
-    # 3) manter só itens do balanço
     rows = filter_to_balance_sheet(rows)
 
-    # 4) filtrar país / mundo
     is_world = normalize(country_name) in ["world", "mundo", "global", "all"]
 
+    # mundo
     if is_world:
-        # tenta filtrar a linha oficial "World"
         p_env, st2 = call_fas("LookupData/GetCountries")
         if st2 == 200 and p_env.get("ok"):
             countries_list = p_env.get("data", [])
@@ -367,12 +280,13 @@ def psd():
                 world_rows = [r for r in rows if (r.get("CountryCode") or "").strip() == world_code]
                 if world_rows:
                     summary, units, meta = summarize(world_rows)
-                    meta["CountryName"] = world_name or meta.get("CountryName") or "World"
+                    if world_name:
+                        meta["CountryName"] = world_name
                     return jsonify({
                         "request": {"commodity": commodity_name, "country": country_name, "year": year},
                         "resolved": {
                             "CommodityCode": commodity_code,
-                            **(resolved_commodity or {}),
+                            "CommodityName_found": commodity_found_name,
                             "CountryScope": "World (official row)"
                         },
                         "meta": meta,
@@ -380,13 +294,12 @@ def psd():
                         "units": units
                     }), 200
 
-        # fallback: soma tudo
         summary, units, meta = sum_across_countries(rows)
         return jsonify({
             "request": {"commodity": commodity_name, "country": country_name, "year": year},
             "resolved": {
                 "CommodityCode": commodity_code,
-                **(resolved_commodity or {}),
+                "CommodityName_found": commodity_found_name,
                 "CountryScope": "World (computed sum)"
             },
             "meta": meta,
@@ -394,7 +307,7 @@ def psd():
             "units": units
         }), 200
 
-    # país normal (PT->EN automático)
+    # país
     p_env, st2 = call_fas("LookupData/GetCountries")
     if st2 != 200 or not p_env.get("ok"):
         return jsonify({"error": "Falha ao buscar países", "details": p_env}), 502
@@ -413,7 +326,7 @@ def psd():
         "request": {"commodity": commodity_name, "country": country_name, "year": year},
         "resolved": {
             "CommodityCode": commodity_code,
-            **(resolved_commodity or {}),
+            "CommodityName_found": commodity_found_name,
             "CountryCode": country_code,
             "CountryName_found": found_country_name
         },
