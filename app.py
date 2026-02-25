@@ -12,6 +12,8 @@ BASE = "https://apps.fas.usda.gov/PSDOnlineDataServices/api"
 _CACHE = {
     "commodities": None,
     "countries": None,
+    # cache de dados por (commodityCode, marketYear) -> lista de linhas
+    "year_data": {}
 }
 
 def call_fas(endpoint, params=None):
@@ -19,7 +21,7 @@ def call_fas(endpoint, params=None):
         return {"ok": False, "error": "FAS_API_KEY não configurada no Render."}, 500
 
     url = f"{BASE}/{endpoint.lstrip('/')}"
-    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/2.0"}
+    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/2.1"}
 
     try:
         r = requests.get(url, headers=headers, params=params or {}, timeout=60)
@@ -82,7 +84,6 @@ PT_COUNTRY_ALIASES = {
     "rússia": "russia",
 }
 
-
 # Apelidos amigáveis para métricas (você pode pedir em PT)
 # (a API usa "AttributeDescription" em inglês)
 METRIC_ALIASES = {
@@ -92,6 +93,7 @@ METRIC_ALIASES = {
 
     "consumo": "Domestic Consumption",
     "consumo domestico": "Domestic Consumption",
+    "consumo doméstico": "Domestic Consumption",
     "domestic consumption": "Domestic Consumption",
 
     "importacao": "MY Imports",
@@ -116,7 +118,6 @@ METRIC_ALIASES = {
     "total supply": "Total Supply",
 }
 
-
 def metric_canonical(metric: str) -> str:
     m = normalize(metric)
     return METRIC_ALIASES.get(m, metric)  # se já vier em inglês correto, passa direto
@@ -139,31 +140,25 @@ def score_commodity(name: str, query_norm: str) -> int:
     n = normalize(name)
     score = 0
 
-    # Match forte
     if query_norm and query_norm in n:
         score += 10
 
     if query_norm in ["soja", "soybeans", "soybean", "soy"]:
-        # preferir "Oilseed, Soybean" e "Soybeans"
         if "oilseed" in n and "soybean" in n:
             score += 250
         if n.strip() == "soybeans" or n.startswith("soybeans"):
             score += 200
         if "meal" in n:
             score -= 200
-        if "oil," in n or n.startswith("oil "):
-            score -= 120
         if "oil, soybean" in n:
             score -= 120
 
-    # nomes mais curtos tendem a ser commodity-base
     score -= max(0, len(n) - 24) // 5
     return score
 
 
 def resolve_commodity(commodities_list, user_input: str):
     raw = (user_input or "").strip()
-    # se vier um código numérico direto
     if re.fullmatch(r"\d{5,8}", raw):
         return raw, None
 
@@ -192,7 +187,6 @@ def resolve_commodity(commodities_list, user_input: str):
     if not candidates:
         return None, None
 
-    # escolher melhor candidato
     best_code, best_name = None, None
     best_score = -10**9
     for nm, code in candidates:
@@ -218,6 +212,7 @@ def resolve_country(countries_list, user_input: str):
         code = (it.get("CountryCode") or it.get("Code") or it.get("Id") or "").strip()
         if not nm or not code:
             continue
+
         nm_norm = normalize(nm)
         nm_clean = strip_nonletters(nm)
 
@@ -228,7 +223,6 @@ def resolve_country(countries_list, user_input: str):
 
 
 def pick_world_code(countries_list):
-    # tenta achar uma linha oficial "World"
     for name_try in ["World", "world", "WORLD"]:
         code, nm = resolve_country(countries_list, name_try)
         if code:
@@ -258,6 +252,23 @@ def fetch_countries():
 
     _CACHE["countries"] = env.get("data", [])
     return _CACHE["countries"], None
+
+
+def fetch_year_data(commodity_code: str, market_year: int):
+    key = (commodity_code, market_year)
+    if key in _CACHE["year_data"]:
+        return _CACHE["year_data"][key], None
+
+    env, st = call_fas("CommodityData/GetCommodityDataByYear", params={"CommodityCode": commodity_code, "marketYear": market_year})
+    if st != 200 or not env.get("ok"):
+        return None, {"error": "Falha ao buscar dados", "details": env}
+
+    rows = env.get("data", [])
+    _CACHE["year_data"][key] = rows
+    # evita crescimento infinito do cache (mantém no máximo 40 combinações)
+    if len(_CACHE["year_data"]) > 40:
+        _CACHE["year_data"].pop(next(iter(_CACHE["year_data"])))
+    return rows, None
 
 
 def filter_to_balance_sheet(rows):
@@ -336,6 +347,7 @@ def home():
         "endpoints": {
             "psd": "/psd?commodity=soja&country=brasil&year=2024",
             "top": "/top?commodity=milho&year=2024&metric=producao&n=15",
+            "series": "/series?commodity=milho&country=brasil&metric=producao&from=2015&to=2024",
             "findCommodity": "/findCommodity?name=soja"
         }
     })
@@ -349,7 +361,6 @@ def health():
 @app.route("/findCommodity", methods=["GET"])
 def find_commodity():
     name = request.args.get("name", "")
-
     commodities_list, err = fetch_commodities()
     if err:
         return jsonify(err), 502
@@ -375,11 +386,15 @@ def psd():
     if not commodity_code:
         return jsonify({"error": f"Commodity não encontrada: {commodity_name}"}), 404
 
-    d_env, st = call_fas("CommodityData/GetCommodityDataByYear", params={"CommodityCode": commodity_code, "marketYear": int(year)})
-    if st != 200 or not d_env.get("ok"):
-        return jsonify({"error": "Falha ao buscar dados", "details": d_env}), 502
+    try:
+        year_i = int(year)
+    except Exception:
+        return jsonify({"error": "year precisa ser número (ex.: 2024)."}), 400
 
-    rows = d_env.get("data", [])
+    rows, errd = fetch_year_data(commodity_code, year_i)
+    if errd:
+        return jsonify(errd), 502
+
     if not isinstance(rows, list) or not rows:
         return jsonify({"error": "Sem dados retornados para esse ano/commodity."}), 404
 
@@ -391,7 +406,6 @@ def psd():
     if is_world:
         countries_list, err2 = fetch_countries()
         if err2:
-            # fallback: soma tudo
             summary, units, meta = sum_across_countries(rows)
             return jsonify({
                 "request": {"commodity": commodity_name, "country": country_name, "year": year},
@@ -472,7 +486,7 @@ def top():
 
     try:
         n_i = int(n)
-        n_i = max(1, min(n_i, 60))  # limita para não virar gigante
+        n_i = max(1, min(n_i, 60))
     except Exception:
         return jsonify({"error": "n precisa ser número (ex.: 15)."}), 400
 
@@ -486,15 +500,10 @@ def top():
     if not commodity_code:
         return jsonify({"error": f"Commodity não encontrada: {commodity_name}"}), 404
 
-    d_env, st = call_fas("CommodityData/GetCommodityDataByYear", params={"CommodityCode": commodity_code, "marketYear": year_i})
-    if st != 200 or not d_env.get("ok"):
-        return jsonify({"error": "Falha ao buscar dados", "details": d_env}), 502
+    rows, errd = fetch_year_data(commodity_code, year_i)
+    if errd:
+        return jsonify(errd), 502
 
-    rows = d_env.get("data", [])
-    if not isinstance(rows, list) or not rows:
-        return jsonify({"error": "Sem dados retornados para esse ano/commodity."}), 404
-
-    # filtra só a métrica desejada
     metric_rows = []
     unit = None
     month = None
@@ -507,22 +516,16 @@ def top():
             continue
 
         val = r.get("Value")
-        # só aceita numérico
         if not isinstance(val, (int, float)):
             continue
 
         ccode = (r.get("CountryCode") or "").strip()
         cname = (r.get("CountryName") or "").strip()
 
-        # ignora "World" se existir para não aparecer no top
         if normalize(cname) in ["world"]:
             continue
 
-        metric_rows.append({
-            "countryCode": ccode,
-            "countryName": cname,
-            "value": val
-        })
+        metric_rows.append({"countryCode": ccode, "countryName": cname, "value": val})
 
         if unit is None:
             unit = (r.get("UnitDescription") or "").strip()
@@ -536,23 +539,156 @@ def top():
     if not metric_rows:
         return jsonify({
             "error": "Sem linhas para essa métrica.",
-            "hint": "Verifique o nome da métrica (ex.: Production, MY Exports, Ending Stocks).",
+            "hint": "Ex.: Production, MY Exports, Ending Stocks.",
             "metric_used": metric
         }), 404
 
-    # ordena desc e pega top N
     metric_rows.sort(key=lambda x: x["value"], reverse=True)
     top_rows = metric_rows[:n_i]
 
     return jsonify({
         "request": {"commodity": commodity_name, "year": year_i, "metric": metric_in, "n": n_i},
         "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "metric_used": metric},
-        "meta": {
-            "CommodityDescription": comm_desc,
-            "MarketYear": str(year_i),
-            "Month": month,
-            "CalendarYear": cal_year
-        },
+        "meta": {"CommodityDescription": comm_desc, "MarketYear": str(year_i), "Month": month, "CalendarYear": cal_year},
         "unit": unit,
         "top": top_rows
+    }), 200
+
+
+@app.route("/series", methods=["GET"])
+def series():
+    """
+    Série histórica (por país ou mundo) de uma métrica.
+
+    Exemplos:
+      /series?commodity=milho&country=brasil&metric=producao&from=2015&to=2024
+      /series?commodity=soja&country=mundo&metric=estoque%20final&from=2010&to=2024
+    """
+    commodity_name = request.args.get("commodity", "")
+    country_name = request.args.get("country", "mundo")
+    metric_in = request.args.get("metric", "Production")
+    y_from = request.args.get("from", "")
+    y_to = request.args.get("to", "")
+
+    if not commodity_name or not y_from or not y_to:
+        return jsonify({"error": "Use /series?commodity=milho&country=brasil&metric=producao&from=2015&to=2024"}), 400
+
+    try:
+        y_from_i = int(y_from)
+        y_to_i = int(y_to)
+    except Exception:
+        return jsonify({"error": "from e to precisam ser números (ex.: 2015 e 2024)."}), 400
+
+    if y_to_i < y_from_i:
+        return jsonify({"error": "to precisa ser >= from."}), 400
+
+    # limita para não ficar pesado
+    if (y_to_i - y_from_i) > 40:
+        return jsonify({"error": "Intervalo muito grande. Use no máximo 40 anos por chamada."}), 400
+
+    metric = metric_canonical(metric_in)
+
+    commodities_list, err = fetch_commodities()
+    if err:
+        return jsonify(err), 502
+
+    commodity_code, commodity_found = resolve_commodity(commodities_list, commodity_name)
+    if not commodity_code:
+        return jsonify({"error": f"Commodity não encontrada: {commodity_name}"}), 404
+
+    is_world = normalize(country_name) in ["world", "mundo", "global", "all"]
+
+    country_code = None
+    country_label = None
+    world_code = None
+    world_name = None
+
+    countries_list = None
+    if not is_world:
+        countries_list, errc = fetch_countries()
+        if errc:
+            return jsonify(errc), 502
+        country_code, country_label = resolve_country(countries_list, country_name)
+        if not country_code:
+            return jsonify({"error": f"País não encontrado: {country_name}"}), 404
+    else:
+        countries_list, errc = fetch_countries()
+        if not errc and countries_list:
+            world_code, world_name = pick_world_code(countries_list)
+
+    series_points = []
+    unit = None
+    meta_hint = {"CommodityDescription": None, "Month": None, "CalendarYear": None}
+
+    for y in range(y_from_i, y_to_i + 1):
+        rows, errd = fetch_year_data(commodity_code, y)
+        if errd:
+            # se um ano falhar, ainda devolvemos os demais
+            series_points.append({"year": y, "value": None, "note": "fetch_error"})
+            continue
+
+        # pega só a métrica
+        mrows = [r for r in rows if (r.get("AttributeDescription") or "").strip() == metric]
+        if not mrows:
+            series_points.append({"year": y, "value": None})
+            continue
+
+        # tenta mundo oficial
+        if is_world and world_code:
+            mr = next((r for r in mrows if (r.get("CountryCode") or "").strip() == world_code), None)
+            if mr:
+                series_points.append({"year": y, "value": mr.get("Value")})
+                if unit is None:
+                    unit = (mr.get("UnitDescription") or "").strip()
+                if meta_hint["CommodityDescription"] is None:
+                    meta_hint["CommodityDescription"] = (mr.get("CommodityDescription") or "").strip()
+                if meta_hint["Month"] is None:
+                    meta_hint["Month"] = (mr.get("Month") or "").strip()
+                if meta_hint["CalendarYear"] is None:
+                    meta_hint["CalendarYear"] = (mr.get("CalendarYear") or "").strip()
+                continue
+
+        # país
+        if not is_world and country_code:
+            mr = next((r for r in mrows if (r.get("CountryCode") or "").strip() == country_code), None)
+            if mr:
+                series_points.append({"year": y, "value": mr.get("Value")})
+                if unit is None:
+                    unit = (mr.get("UnitDescription") or "").strip()
+                if meta_hint["CommodityDescription"] is None:
+                    meta_hint["CommodityDescription"] = (mr.get("CommodityDescription") or "").strip()
+                if meta_hint["Month"] is None:
+                    meta_hint["Month"] = (mr.get("Month") or "").strip()
+                if meta_hint["CalendarYear"] is None:
+                    meta_hint["CalendarYear"] = (mr.get("CalendarYear") or "").strip()
+                continue
+
+        # fallback mundo: soma tudo (ignora "World" se existir)
+        if is_world and not world_code:
+            total = 0
+            any_val = False
+            for r in mrows:
+                cname = (r.get("CountryName") or "").strip()
+                if normalize(cname) == "world":
+                    continue
+                v = r.get("Value")
+                if isinstance(v, (int, float)):
+                    total += v
+                    any_val = True
+                    if unit is None:
+                        unit = (r.get("UnitDescription") or "").strip()
+            series_points.append({"year": y, "value": total if any_val else None})
+            continue
+
+        # não achou
+        series_points.append({"year": y, "value": None})
+
+    resolved_country = "World" if is_world else country_label
+
+    return jsonify({
+        "request": {"commodity": commodity_name, "country": country_name, "metric": metric_in, "from": y_from_i, "to": y_to_i},
+        "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "metric_used": metric, "country_resolved": resolved_country},
+        "unit": unit,
+        "meta_hint": meta_hint,
+        "series": series_points
     }), 200
