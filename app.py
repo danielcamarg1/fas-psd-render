@@ -8,12 +8,10 @@ app = Flask(__name__)
 FAS_KEY = (os.getenv("FAS_API_KEY", "") or "").strip()
 BASE = "https://apps.fas.usda.gov/PSDOnlineDataServices/api"
 
-# Cache simples em memória (evita chamar a lista toda a cada requisição)
 _CACHE = {
     "commodities": None,
     "countries": None,
-    # cache de dados por (commodityCode, marketYear) -> lista de linhas
-    "year_data": {}
+    "year_data": {}  # (commodityCode, marketYear) -> rows
 }
 
 def call_fas(endpoint, params=None):
@@ -21,7 +19,7 @@ def call_fas(endpoint, params=None):
         return {"ok": False, "error": "FAS_API_KEY não configurada no Render."}, 500
 
     url = f"{BASE}/{endpoint.lstrip('/')}"
-    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/2.1"}
+    headers = {"API_KEY": FAS_KEY, "User-Agent": "fas-psd-render/2.2"}
 
     try:
         r = requests.get(url, headers=headers, params=params or {}, timeout=60)
@@ -46,7 +44,6 @@ def strip_nonletters(s: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", normalize(s))
 
 
-# Apelidos PT -> EN para commodities (expandimos depois: algodão, proteínas etc.)
 PT_COMMODITY_ALIASES = {
     "soja": ["soybeans", "soybean", "soy"],
     "milho": ["corn", "maize"],
@@ -59,7 +56,6 @@ PT_COMMODITY_ALIASES = {
     "açúcar": ["sugar"],
 }
 
-# Apelidos PT -> EN para países (expandimos conforme uso)
 PT_COUNTRY_ALIASES = {
     "brasil": "brazil",
     "eua": "united states",
@@ -84,8 +80,6 @@ PT_COUNTRY_ALIASES = {
     "rússia": "russia",
 }
 
-# Apelidos amigáveis para métricas (você pode pedir em PT)
-# (a API usa "AttributeDescription" em inglês)
 METRIC_ALIASES = {
     "producao": "Production",
     "produção": "Production",
@@ -120,7 +114,7 @@ METRIC_ALIASES = {
 
 def metric_canonical(metric: str) -> str:
     m = normalize(metric)
-    return METRIC_ALIASES.get(m, metric)  # se já vier em inglês correto, passa direto
+    return METRIC_ALIASES.get(m, metric)
 
 
 def commodity_display(it: dict) -> str:
@@ -133,16 +127,13 @@ def commodity_code(it: dict) -> str:
 
 
 def score_commodity(name: str, query_norm: str) -> int:
-    """
-    Escolha de commodity:
-    - Para "soja": preferir grão ("Oilseed, Soybean" ou "Soybeans") e evitar meal/oil.
-    """
     n = normalize(name)
     score = 0
 
     if query_norm and query_norm in n:
         score += 10
 
+    # soja: preferir grão
     if query_norm in ["soja", "soybeans", "soybean", "soy"]:
         if "oilseed" in n and "soybean" in n:
             score += 250
@@ -265,7 +256,6 @@ def fetch_year_data(commodity_code: str, market_year: int):
 
     rows = env.get("data", [])
     _CACHE["year_data"][key] = rows
-    # evita crescimento infinito do cache (mantém no máximo 40 combinações)
     if len(_CACHE["year_data"]) > 40:
         _CACHE["year_data"].pop(next(iter(_CACHE["year_data"])))
     return rows, None
@@ -283,12 +273,7 @@ def filter_to_balance_sheet(rows):
         "Ending Stocks",
         "Total Supply",
     }
-    out = []
-    for r in rows:
-        ad = (r.get("AttributeDescription") or "").strip()
-        if ad in wanted:
-            out.append(r)
-    return out
+    return [r for r in rows if (r.get("AttributeDescription") or "").strip() in wanted]
 
 
 def summarize(rows):
@@ -313,31 +298,51 @@ def summarize(rows):
     return summary, units, meta
 
 
-def sum_across_countries(rows):
-    acc = {}
-    units = {}
-    meta = {"CountryName": "World (computed sum)"}
-
+def meta_from_any_row(rows):
+    """
+    Para mundo (soma), escolhe um registro numérico qualquer só para preencher meta_hint.
+    """
     for r in rows:
-        k = (r.get("AttributeDescription") or "").strip()
-        if not k:
+        # escolhe um row que tenha unidade e descrição
+        if r.get("UnitDescription") and r.get("CommodityDescription") and r.get("Month") and r.get("CalendarYear"):
+            return {
+                "CommodityDescription": (r.get("CommodityDescription") or "").strip(),
+                "Month": (r.get("Month") or "").strip(),
+                "CalendarYear": (r.get("CalendarYear") or "").strip()
+            }
+    # fallback parcial
+    for r in rows:
+        if r.get("CommodityDescription"):
+            return {
+                "CommodityDescription": (r.get("CommodityDescription") or "").strip(),
+                "Month": (r.get("Month") or "").strip() if r.get("Month") else None,
+                "CalendarYear": (r.get("CalendarYear") or "").strip() if r.get("CalendarYear") else None
+            }
+    return {"CommodityDescription": None, "Month": None, "CalendarYear": None}
+
+
+def sum_world_for_metric(rows_metric):
+    """
+    Soma valores numéricos ignorando eventual linha 'World'.
+    Retorna: total, unit (primeira unit encontrada), meta_hint (de qualquer linha).
+    """
+    total = 0.0
+    any_val = False
+    unit = None
+
+    for r in rows_metric:
+        cname = (r.get("CountryName") or "").strip()
+        if normalize(cname) == "world":
             continue
+
         v = r.get("Value")
         if isinstance(v, (int, float)):
-            acc[k] = acc.get(k, 0) + v
-        if k not in units:
-            units[k] = (r.get("UnitDescription") or "").strip()
+            total += float(v)
+            any_val = True
+            if unit is None:
+                unit = (r.get("UnitDescription") or "").strip()
 
-        if "CommodityDescription" not in meta and r.get("CommodityDescription"):
-            meta["CommodityDescription"] = (r.get("CommodityDescription") or "").strip()
-        if "MarketYear" not in meta and r.get("MarketYear"):
-            meta["MarketYear"] = r.get("MarketYear")
-        if "Month" not in meta and r.get("Month"):
-            meta["Month"] = r.get("Month")
-        if "CalendarYear" not in meta and r.get("CalendarYear"):
-            meta["CalendarYear"] = r.get("CalendarYear")
-
-    return acc, units, meta
+    return (total if any_val else None), unit, meta_from_any_row(rows_metric)
 
 
 @app.route("/", methods=["GET"])
@@ -348,7 +353,8 @@ def home():
             "psd": "/psd?commodity=soja&country=brasil&year=2024",
             "top": "/top?commodity=milho&year=2024&metric=producao&n=15",
             "series": "/series?commodity=milho&country=brasil&metric=producao&from=2015&to=2024",
-            "findCommodity": "/findCommodity?name=soja"
+            "findCommodity": "/findCommodity?name=soja",
+            "findCountry": "/findCountry?name=brasil"
         }
     })
 
@@ -364,8 +370,17 @@ def find_commodity():
     commodities_list, err = fetch_commodities()
     if err:
         return jsonify(err), 502
-
     code, found_name = resolve_commodity(commodities_list, name)
+    return jsonify({"input": name, "chosen_code": code, "chosen_name": found_name}), 200
+
+
+@app.route("/findCountry", methods=["GET"])
+def find_country():
+    name = request.args.get("name", "")
+    countries_list, err = fetch_countries()
+    if err:
+        return jsonify(err), 502
+    code, found_name = resolve_country(countries_list, name)
     return jsonify({"input": name, "chosen_code": code, "chosen_name": found_name}), 200
 
 
@@ -399,43 +414,49 @@ def psd():
         return jsonify({"error": "Sem dados retornados para esse ano/commodity."}), 404
 
     rows = filter_to_balance_sheet(rows)
-
     is_world = normalize(country_name) in ["world", "mundo", "global", "all"]
 
-    # mundo
     if is_world:
         countries_list, err2 = fetch_countries()
-        if err2:
-            summary, units, meta = sum_across_countries(rows)
-            return jsonify({
-                "request": {"commodity": commodity_name, "country": country_name, "year": year},
-                "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "CountryScope": "World (computed sum)"},
-                "meta": meta,
-                "balance_sheet": summary,
-                "units": units
-            }), 200
+        if not err2:
+            world_code, world_name = pick_world_code(countries_list)
+            if world_code:
+                world_rows = [r for r in rows if (r.get("CountryCode") or "").strip() == world_code]
+                if world_rows:
+                    summary, units, meta = summarize(world_rows)
+                    if world_name:
+                        meta["CountryName"] = world_name
+                    return jsonify({
+                        "request": {"commodity": commodity_name, "country": country_name, "year": year},
+                        "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "CountryScope": "World (official row)"},
+                        "meta": meta,
+                        "balance_sheet": summary,
+                        "units": units
+                    }), 200
 
-        world_code, world_name = pick_world_code(countries_list)
-        if world_code:
-            world_rows = [r for r in rows if (r.get("CountryCode") or "").strip() == world_code]
-            if world_rows:
-                summary, units, meta = summarize(world_rows)
-                if world_name:
-                    meta["CountryName"] = world_name
-                return jsonify({
-                    "request": {"commodity": commodity_name, "country": country_name, "year": year},
-                    "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "CountryScope": "World (official row)"},
-                    "meta": meta,
-                    "balance_sheet": summary,
-                    "units": units
-                }), 200
+        # fallback soma
+        acc = {}
+        units = {}
+        for r in rows:
+            k = (r.get("AttributeDescription") or "").strip()
+            v = r.get("Value")
+            cname = (r.get("CountryName") or "").strip()
+            if normalize(cname) == "world":
+                continue
+            if isinstance(v, (int, float)):
+                acc[k] = acc.get(k, 0) + v
+                if k not in units:
+                    units[k] = (r.get("UnitDescription") or "").strip()
 
-        summary, units, meta = sum_across_countries(rows)
+        meta = meta_from_any_row(rows)
+        meta["CountryName"] = "World (computed sum)"
+        meta["MarketYear"] = str(year_i)
+
         return jsonify({
             "request": {"commodity": commodity_name, "country": country_name, "year": year},
             "resolved": {"CommodityCode": commodity_code, "CommodityName_found": commodity_found, "CountryScope": "World (computed sum)"},
             "meta": meta,
-            "balance_sheet": summary,
+            "balance_sheet": acc,
             "units": units
         }), 200
 
@@ -464,13 +485,6 @@ def psd():
 
 @app.route("/top", methods=["GET"])
 def top():
-    """
-    Top N países por métrica.
-
-    Exemplo:
-      /top?commodity=milho&year=2024&metric=producao&n=15
-      /top?commodity=soja&year=2024&metric=exportacao&n=20
-    """
     commodity_name = request.args.get("commodity", "")
     year = request.args.get("year", "")
     metric_in = request.args.get("metric", "Production")
@@ -522,7 +536,7 @@ def top():
         ccode = (r.get("CountryCode") or "").strip()
         cname = (r.get("CountryName") or "").strip()
 
-        if normalize(cname) in ["world"]:
+        if normalize(cname) == "world":
             continue
 
         metric_rows.append({"countryCode": ccode, "countryName": cname, "value": val})
@@ -537,11 +551,7 @@ def top():
             comm_desc = (r.get("CommodityDescription") or "").strip()
 
     if not metric_rows:
-        return jsonify({
-            "error": "Sem linhas para essa métrica.",
-            "hint": "Ex.: Production, MY Exports, Ending Stocks.",
-            "metric_used": metric
-        }), 404
+        return jsonify({"error": "Sem linhas para essa métrica.", "metric_used": metric}), 404
 
     metric_rows.sort(key=lambda x: x["value"], reverse=True)
     top_rows = metric_rows[:n_i]
@@ -557,13 +567,6 @@ def top():
 
 @app.route("/series", methods=["GET"])
 def series():
-    """
-    Série histórica (por país ou mundo) de uma métrica.
-
-    Exemplos:
-      /series?commodity=milho&country=brasil&metric=producao&from=2015&to=2024
-      /series?commodity=soja&country=mundo&metric=estoque%20final&from=2010&to=2024
-    """
     commodity_name = request.args.get("commodity", "")
     country_name = request.args.get("country", "mundo")
     metric_in = request.args.get("metric", "Production")
@@ -582,9 +585,8 @@ def series():
     if y_to_i < y_from_i:
         return jsonify({"error": "to precisa ser >= from."}), 400
 
-    # limita para não ficar pesado
     if (y_to_i - y_from_i) > 40:
-        return jsonify({"error": "Intervalo muito grande. Use no máximo 40 anos por chamada."}), 400
+        return jsonify({"error": "Intervalo muito grande. Use no máximo 40 anos."}), 400
 
     metric = metric_canonical(metric_in)
 
@@ -603,18 +605,14 @@ def series():
     world_code = None
     world_name = None
 
-    countries_list = None
-    if not is_world:
-        countries_list, errc = fetch_countries()
-        if errc:
-            return jsonify(errc), 502
-        country_code, country_label = resolve_country(countries_list, country_name)
-        if not country_code:
-            return jsonify({"error": f"País não encontrado: {country_name}"}), 404
-    else:
-        countries_list, errc = fetch_countries()
-        if not errc and countries_list:
+    countries_list, errc = fetch_countries()
+    if not errc and countries_list:
+        if is_world:
             world_code, world_name = pick_world_code(countries_list)
+        else:
+            country_code, country_label = resolve_country(countries_list, country_name)
+            if not country_code:
+                return jsonify({"error": f"País não encontrado: {country_name}"}), 404
 
     series_points = []
     unit = None
@@ -622,18 +620,17 @@ def series():
 
     for y in range(y_from_i, y_to_i + 1):
         rows, errd = fetch_year_data(commodity_code, y)
-        if errd:
-            # se um ano falhar, ainda devolvemos os demais
+        if errd or not isinstance(rows, list):
             series_points.append({"year": y, "value": None, "note": "fetch_error"})
             continue
 
-        # pega só a métrica
+        # só a métrica
         mrows = [r for r in rows if (r.get("AttributeDescription") or "").strip() == metric]
         if not mrows:
             series_points.append({"year": y, "value": None})
             continue
 
-        # tenta mundo oficial
+        # mundo oficial
         if is_world and world_code:
             mr = next((r for r in mrows if (r.get("CountryCode") or "").strip() == world_code), None)
             if mr:
@@ -649,7 +646,7 @@ def series():
                 continue
 
         # país
-        if not is_world and country_code:
+        if (not is_world) and country_code:
             mr = next((r for r in mrows if (r.get("CountryCode") or "").strip() == country_code), None)
             if mr:
                 series_points.append({"year": y, "value": mr.get("Value")})
@@ -663,27 +660,23 @@ def series():
                     meta_hint["CalendarYear"] = (mr.get("CalendarYear") or "").strip()
                 continue
 
-        # fallback mundo: soma tudo (ignora "World" se existir)
-        if is_world and not world_code:
-            total = 0
-            any_val = False
-            for r in mrows:
-                cname = (r.get("CountryName") or "").strip()
-                if normalize(cname) == "world":
-                    continue
-                v = r.get("Value")
-                if isinstance(v, (int, float)):
-                    total += v
-                    any_val = True
-                    if unit is None:
-                        unit = (r.get("UnitDescription") or "").strip()
-            series_points.append({"year": y, "value": total if any_val else None})
+        # fallback mundo: soma e preenche meta_hint
+        if is_world:
+            total, unit2, mh = sum_world_for_metric(mrows)
+            series_points.append({"year": y, "value": total})
+            if unit is None and unit2:
+                unit = unit2
+            if meta_hint["CommodityDescription"] is None and mh.get("CommodityDescription"):
+                meta_hint["CommodityDescription"] = mh.get("CommodityDescription")
+            if meta_hint["Month"] is None and mh.get("Month"):
+                meta_hint["Month"] = mh.get("Month")
+            if meta_hint["CalendarYear"] is None and mh.get("CalendarYear"):
+                meta_hint["CalendarYear"] = mh.get("CalendarYear")
             continue
 
-        # não achou
         series_points.append({"year": y, "value": None})
 
-    resolved_country = "World" if is_world else country_label
+    resolved_country = (world_name or "World") if is_world else (country_label or country_name)
 
     return jsonify({
         "request": {"commodity": commodity_name, "country": country_name, "metric": metric_in, "from": y_from_i, "to": y_to_i},
