@@ -2,6 +2,7 @@ import os
 import re
 import requests
 from flask import Flask, request, jsonify
+from wasde_client import fetch_latest_wasde_text, search_wasde
 
 app = Flask(__name__)
 
