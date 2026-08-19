@@ -3,6 +3,7 @@ import re
 import time
 import requests
 from flask import Flask, request, jsonify
+from reports_client import search_report, REPORTS
 
 app = Flask(__name__)
 
@@ -1463,3 +1464,47 @@ def compare():
         "results": series_by_country,
         "resolved_countries": resolved_countries
     }), 200
+
+@app.route("/report/catalog", methods=["GET"])
+def report_catalog():
+    return jsonify({
+        "status": "ok",
+        "reports": [
+            {
+                "id": report_id,
+                "name": info.get("name"),
+                "url": info.get("url"),
+                "commodities": info.get("commodities", [])
+            }
+            for report_id, info in REPORTS.items()
+        ]
+    }), 200
+
+
+@app.route("/report/search", methods=["GET"])
+def report_search():
+    report = request.args.get("report", "").strip()
+    commodity = request.args.get("commodity", "").strip()
+    query = request.args.get("query", "").strip()
+
+    try:
+        max_results = int(request.args.get("max_results", 8))
+        max_results = max(1, min(max_results, 12))
+    except Exception:
+        max_results = 8
+
+    if not query and not commodity:
+        return jsonify({
+            "status": "error",
+            "message": "Informe query ou commodity. Exemplo: /report/search?commodity=soja&query=exports China logistics"
+        }), 400
+
+    data = search_report(
+        report_id=report or None,
+        query=query,
+        commodity=commodity or None,
+        max_results=max_results
+    )
+
+    status_code = 200 if data.get("status") == "ok" else 500
+    return jsonify(data), status_code
