@@ -946,3 +946,184 @@ def compare():
         "results": series_by_country,
         "resolved_countries": resolved_countries
     }), 200
+
+@app.route("/bundle", methods=["GET"])
+def bundle():
+    """
+    Retorna em uma única chamada:
+    - balanço mundial da commodity
+    - top importadores
+    - top exportadores
+
+    Exemplo:
+    /bundle?commodity=soja&year=2024&n=10
+    """
+    commodity_name = request.args.get("commodity", "")
+    year = request.args.get("year", "")
+    n = request.args.get("n", "10")
+
+    if not commodity_name or not year:
+        return jsonify({
+            "error": "Use /bundle?commodity=soja&year=2024&n=10"
+        }), 400
+
+    try:
+        year_i = int(year)
+    except Exception:
+        return jsonify({
+            "error": "year precisa ser número. Exemplo: 2024."
+        }), 400
+
+    try:
+        n_i = int(n)
+        n_i = max(1, min(n_i, 30))
+    except Exception:
+        n_i = 10
+
+    commodities_list, err = fetch_commodities()
+    if err:
+        return jsonify(err), 502
+
+    commodity_code, commodity_found = resolve_commodity(commodities_list, commodity_name)
+
+    if not commodity_code:
+        return jsonify({
+            "error": f"Commodity não encontrada: {commodity_name}"
+        }), 404
+
+    rows, errd = fetch_year_data(commodity_code, year_i)
+
+    if errd:
+        return jsonify(errd), 502
+
+    if not isinstance(rows, list) or not rows:
+        return jsonify({
+            "error": "Sem dados retornados para esse ano/commodity."
+        }), 404
+
+    rows_bs = filter_to_balance_sheet(rows)
+
+    # -----------------------------
+    # 1. Balanço mundial
+    # -----------------------------
+    countries_list, errc = fetch_countries()
+    world_code = None
+    world_name = None
+
+    if not errc and countries_list:
+        world_code, world_name = pick_world_code(countries_list)
+
+    world_rows = []
+
+    if world_code:
+        world_rows = [
+            r for r in rows_bs
+            if (r.get("CountryCode") or "").strip() == world_code
+        ]
+
+    if world_rows:
+        balance_sheet, units, meta = summarize(world_rows)
+
+        if world_name:
+            meta["CountryName"] = world_name
+
+        world_scope = "World (official row)"
+    else:
+        acc = {}
+        units = {}
+
+        for r in rows_bs:
+            k = (r.get("AttributeDescription") or "").strip()
+            v = r.get("Value")
+            cname = (r.get("CountryName") or "").strip()
+
+            if normalize(cname) == "world":
+                continue
+
+            if isinstance(v, (int, float)):
+                acc[k] = acc.get(k, 0) + v
+
+                if k not in units:
+                    units[k] = (r.get("UnitDescription") or "").strip()
+
+        balance_sheet = acc
+        meta = meta_from_any_row(rows_bs)
+        meta["CountryName"] = "World (computed sum)"
+        meta["MarketYear"] = str(year_i)
+        world_scope = "World (computed sum)"
+
+    # -----------------------------
+    # 2. Top importadores
+    # -----------------------------
+    import_rows = []
+
+    for r in rows:
+        ad = (r.get("AttributeDescription") or "").strip()
+
+        if ad != "MY Imports":
+            continue
+
+        val = r.get("Value")
+
+        if not isinstance(val, (int, float)):
+            continue
+
+        cname = (r.get("CountryName") or "").strip()
+
+        if normalize(cname) == "world":
+            continue
+
+        import_rows.append({
+            "countryCode": (r.get("CountryCode") or "").strip(),
+            "countryName": cname,
+            "value": val
+        })
+
+    import_rows.sort(key=lambda x: x["value"], reverse=True)
+
+    # -----------------------------
+    # 3. Top exportadores
+    # -----------------------------
+    export_rows = []
+
+    for r in rows:
+        ad = (r.get("AttributeDescription") or "").strip()
+
+        if ad != "MY Exports":
+            continue
+
+        val = r.get("Value")
+
+        if not isinstance(val, (int, float)):
+            continue
+
+        cname = (r.get("CountryName") or "").strip()
+
+        if normalize(cname) == "world":
+            continue
+
+        export_rows.append({
+            "countryCode": (r.get("CountryCode") or "").strip(),
+            "countryName": cname,
+            "value": val
+        })
+
+    export_rows.sort(key=lambda x: x["value"], reverse=True)
+
+    return jsonify({
+        "request": {
+            "commodity": commodity_name,
+            "year": year_i,
+            "n": n_i
+        },
+        "resolved": {
+            "CommodityCode": commodity_code,
+            "CommodityName_found": commodity_found,
+            "CountryScope": world_scope
+        },
+        "meta": meta,
+        "balance_sheet": balance_sheet,
+        "units": units,
+        "top_importers": import_rows[:n_i],
+        "top_exporters": export_rows[:n_i]
+    }), 200
