@@ -39,6 +39,32 @@ def normalize_text(text):
     return text.strip()
 
 
+def download_pdf(url):
+    response = None
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(
+                url,
+                timeout=(45, 180),
+                headers={"User-Agent": "fas-psd-render-reports/1.1"}
+            )
+            response.raise_for_status()
+            return response
+
+        except Exception as e:
+            last_error = str(e)
+            response = None
+
+    return {
+        "status": "error",
+        "message": "Falha ao baixar o relatório PDF após 3 tentativas.",
+        "details": last_error,
+        "source_url": url
+    }
+
+
 def fetch_pdf_text(report_id):
     report_id = (report_id or "").strip().lower()
 
@@ -55,30 +81,10 @@ def fetch_pdf_text(report_id):
     report = REPORTS[report_id]
     url = report["url"]
 
-        response = None
-    last_error = None
+    response = download_pdf(url)
 
-    for attempt in range(1, 4):
-        try:
-            response = requests.get(
-                url,
-                timeout=(45, 180),
-                headers={"User-Agent": "fas-psd-render-reports/1.1"}
-            )
-            response.raise_for_status()
-            break
-
-        except Exception as e:
-            last_error = str(e)
-            response = None
-
-    if response is None:
-        return {
-            "status": "error",
-            "message": "Falha ao baixar o relatório PDF após 3 tentativas.",
-            "details": last_error,
-            "source_url": url
-        }
+    if isinstance(response, dict) and response.get("status") == "error":
+        return response
 
     try:
         reader = PdfReader(io.BytesIO(response.content))
@@ -130,6 +136,30 @@ def infer_report_from_commodity(commodity):
     return "grain"
 
 
+def split_into_snippets(text):
+    parts = re.split(r"\n\s*\n|(?<=[.!?])\s+(?=[A-Z])", text)
+    clean = []
+    buffer = ""
+
+    for part in parts:
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if len(buffer) + len(part) < 1200:
+            buffer = (buffer + " " + part).strip()
+        else:
+            if buffer:
+                clean.append(buffer)
+            buffer = part
+
+    if buffer:
+        clean.append(buffer)
+
+    return clean
+
+
 def search_report(report_id=None, query="", commodity=None, max_results=8):
     query = (query or "").strip()
 
@@ -164,9 +194,9 @@ def search_report(report_id=None, query="", commodity=None, max_results=8):
         text = page["text"]
         text_lower = text.lower()
 
-        score = sum(1 for term in terms if term in text_lower)
+        page_score = sum(1 for term in terms if term in text_lower)
 
-        if score <= 0:
+        if page_score <= 0:
             continue
 
         snippets = split_into_snippets(text)
@@ -194,28 +224,3 @@ def search_report(report_id=None, query="", commodity=None, max_results=8):
         "matches": matches[:max_results],
         "total_matches_found": len(matches)
     }
-
-
-def split_into_snippets(text):
-    parts = re.split(r"\n\s*\n|(?<=[.!?])\s+(?=[A-Z])", text)
-    clean = []
-
-    buffer = ""
-
-    for part in parts:
-        part = part.strip()
-
-        if not part:
-            continue
-
-        if len(buffer) + len(part) < 1200:
-            buffer = (buffer + " " + part).strip()
-        else:
-            if buffer:
-                clean.append(buffer)
-            buffer = part
-
-    if buffer:
-        clean.append(buffer)
-
-    return clean
