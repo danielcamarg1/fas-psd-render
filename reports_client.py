@@ -55,18 +55,28 @@ def fetch_pdf_text(report_id):
     report = REPORTS[report_id]
     url = report["url"]
 
-    try:
-        response = requests.get(
-            url,
-            timeout=(30, 120),
-            headers={"User-Agent": "fas-psd-render-reports/1.0"}
-        )
-        response.raise_for_status()
-    except Exception as e:
+        response = None
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(
+                url,
+                timeout=(45, 180),
+                headers={"User-Agent": "fas-psd-render-reports/1.1"}
+            )
+            response.raise_for_status()
+            break
+
+        except Exception as e:
+            last_error = str(e)
+            response = None
+
+    if response is None:
         return {
             "status": "error",
-            "message": "Falha ao baixar o relatório PDF.",
-            "details": str(e),
+            "message": "Falha ao baixar o relatório PDF após 3 tentativas.",
+            "details": last_error,
             "source_url": url
         }
 
