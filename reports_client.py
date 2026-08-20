@@ -8,22 +8,74 @@ REPORTS = {
     "grain": {
         "name": "Grain: World Markets and Trade",
         "url": "https://apps.fas.usda.gov/psdonline/circulars/grain.pdf",
-        "commodities": ["trigo", "wheat", "milho", "corn", "arroz", "rice"]
+        "commodities": [
+            "trigo",
+            "wheat",
+            "milho",
+            "corn",
+            "arroz",
+            "rice"
+        ]
     },
     "oilseeds": {
         "name": "Oilseeds: World Markets and Trade",
         "url": "https://apps.fas.usda.gov/psdonline/circulars/oilseeds.pdf",
-        "commodities": ["soja", "soybean", "soybeans"]
+        "commodities": [
+            "soja",
+            "soybean",
+            "soybeans"
+        ]
     },
     "coffee": {
         "name": "Coffee: World Markets and Trade",
         "url": "https://apps.fas.usda.gov/psdonline/circulars/coffee.pdf",
-        "commodities": ["cafe", "café", "coffee"]
+        "commodities": [
+            "cafe",
+            "café",
+            "coffee"
+        ]
+    },
+    "livestock_poultry": {
+        "name": "Livestock and Poultry: World Markets and Trade",
+        "url": "https://apps.fas.usda.gov/psdonline/circulars/livestock_poultry.pdf",
+        "commodities": [
+            "carne bovina",
+            "bovina",
+            "boi",
+            "gado",
+            "beef",
+            "beef and veal",
+            "cattle",
+
+            "carne suina",
+            "carne suína",
+            "suinos",
+            "suínos",
+            "pork",
+            "swine",
+            "hogs",
+
+            "frango",
+            "carne de frango",
+            "aves",
+            "poultry",
+            "chicken",
+            "chicken meat",
+
+            "turkey",
+            "turkey meat"
+        ]
     },
     "production": {
         "name": "World Agricultural Production",
         "url": "https://apps.fas.usda.gov/psdonline/circulars/production.pdf",
-        "commodities": ["safra", "produção", "production", "clima", "weather"]
+        "commodities": [
+            "safra",
+            "produção",
+            "production",
+            "clima",
+            "weather"
+        ]
     }
 }
 
@@ -132,6 +184,35 @@ def infer_report_from_commodity(commodity):
 
     if q in ["cafe", "café", "coffee"]:
         return "coffee"
+
+    if q in [
+        "carne bovina",
+        "bovina",
+        "boi",
+        "gado",
+        "beef",
+        "beef and veal",
+        "cattle",
+
+        "carne suina",
+        "carne suína",
+        "suinos",
+        "suínos",
+        "pork",
+        "swine",
+        "hogs",
+
+        "frango",
+        "carne de frango",
+        "aves",
+        "poultry",
+        "chicken",
+        "chicken meat",
+
+        "turkey",
+        "turkey meat"
+    ]:
+        return "livestock_poultry"
 
     return "grain"
 
